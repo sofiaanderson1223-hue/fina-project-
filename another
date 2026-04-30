@@ -1,0 +1,494 @@
+import math
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+
+st.set_page_config(page_title="Any Stock DCF Calculator", page_icon="📈", layout="wide")
+
+
+# -----------------------------
+# Formatting / safety helpers
+# -----------------------------
+def to_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        value = float(value)
+        if math.isnan(value) or math.isinf(value):
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def safe_input_default(value, default=0.0):
+    value = to_float(value, default)
+    return default if value is None else float(value)
+
+
+def fmt_money(value):
+    value = to_float(value)
+    if value is None:
+        return "N/A"
+
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+
+    if value >= 1_000_000_000_000:
+        return f"{sign}${value / 1_000_000_000_000:,.2f}T"
+    if value >= 1_000_000_000:
+        return f"{sign}${value / 1_000_000_000:,.2f}B"
+    if value >= 1_000_000:
+        return f"{sign}${value / 1_000_000:,.2f}M"
+    return f"{sign}${value:,.0f}"
+
+
+def fmt_price(value):
+    value = to_float(value)
+    if value is None:
+        return "N/A"
+    return f"${value:,.2f}"
+
+
+def fmt_pct(value):
+    value = to_float(value)
+    if value is None:
+        return "N/A"
+    return f"{value:.1%}"
+
+
+def get_info_number(info, possible_keys):
+    for key in possible_keys:
+        if key in info and info[key] is not None:
+            value = to_float(info[key])
+            if value is not None:
+                return value
+    return None
+
+
+def get_statement_row(statement, possible_names):
+    if statement is None or statement.empty:
+        return None
+
+    for name in possible_names:
+        if name in statement.index:
+            values = pd.to_numeric(statement.loc[name], errors="coerce").dropna()
+            if len(values) > 0:
+                return to_float(values.iloc[0])
+    return None
+
+
+# -----------------------------
+# Yahoo Finance functions
+# -----------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def load_yahoo(ticker_symbol):
+    ticker_symbol = ticker_symbol.strip().upper()
+    ticker = yf.Ticker(ticker_symbol)
+
+    try:
+        info = ticker.get_info()
+    except Exception:
+        try:
+            info = ticker.info
+        except Exception:
+            info = {}
+
+    try:
+        cashflow = ticker.cashflow
+    except Exception:
+        cashflow = pd.DataFrame()
+
+    try:
+        balance = ticker.balance_sheet
+    except Exception:
+        balance = pd.DataFrame()
+
+    try:
+        income = ticker.financials
+    except Exception:
+        income = pd.DataFrame()
+
+    try:
+        history = ticker.history(period="5d", auto_adjust=False)
+    except Exception:
+        history = pd.DataFrame()
+
+    return info or {}, cashflow, balance, income, history
+
+
+def build_auto_inputs(info, cashflow, balance, income, history):
+    current_price = get_info_number(info, ["currentPrice", "regularMarketPrice", "previousClose"])
+    if current_price is None and history is not None and not history.empty and "Close" in history.columns:
+        close = pd.to_numeric(history["Close"], errors="coerce").dropna()
+        if len(close) > 0:
+            current_price = to_float(close.iloc[-1])
+
+    shares = get_info_number(info, ["sharesOutstanding", "impliedSharesOutstanding"])
+
+    cash = get_info_number(info, ["totalCash", "cash"])
+    if cash is None:
+        cash = get_statement_row(
+            balance,
+            ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", "Cash"],
+        )
+
+    debt = get_info_number(info, ["totalDebt"])
+    if debt is None:
+        current_debt = get_statement_row(balance, ["Current Debt", "Short Long Term Debt"]) or 0
+        long_debt = get_statement_row(balance, ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"]) or 0
+        debt = current_debt + long_debt
+
+    operating_cash_flow = get_statement_row(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+    capex = get_statement_row(cashflow, ["Capital Expenditure", "Capital Expenditures"])
+
+    if operating_cash_flow is not None and capex is not None:
+        # yfinance usually reports capex as a negative number.
+        free_cash_flow = operating_cash_flow + capex
+    else:
+        free_cash_flow = get_info_number(info, ["freeCashflow"])
+
+    market_cap = get_info_number(info, ["marketCap"])
+    yahoo_enterprise_value = get_info_number(info, ["enterpriseValue"])
+    revenue = get_statement_row(income, ["Total Revenue"])
+    ebit = get_statement_row(income, ["EBIT", "Operating Income"])
+
+    return {
+        "current_price": current_price,
+        "shares": shares,
+        "cash": cash,
+        "debt": debt,
+        "operating_cash_flow": operating_cash_flow,
+        "capex": capex,
+        "free_cash_flow": free_cash_flow,
+        "market_cap": market_cap,
+        "yahoo_enterprise_value": yahoo_enterprise_value,
+        "revenue": revenue,
+        "ebit": ebit,
+    }
+
+
+# -----------------------------
+# DCF math
+# -----------------------------
+def calculate_dcf(base_fcf, growth_rate, years, wacc, terminal_growth, cash, debt, shares, current_price):
+    projected_fcfs = []
+    current_fcf = base_fcf
+
+    for _ in range(years):
+        current_fcf = current_fcf * (1 + growth_rate)
+        projected_fcfs.append(current_fcf)
+
+    pv_fcfs = []
+    for i, fcf in enumerate(projected_fcfs, start=1):
+        pv_fcfs.append(fcf / ((1 + wacc) ** i))
+
+    terminal_value = projected_fcfs[-1] * (1 + terminal_growth) / (wacc - terminal_growth)
+    pv_terminal_value = terminal_value / ((1 + wacc) ** years)
+
+    enterprise_value = sum(pv_fcfs) + pv_terminal_value
+    net_debt = debt - cash
+    equity_value = enterprise_value - net_debt
+    implied_share_price = equity_value / shares
+    upside_downside = implied_share_price / current_price - 1
+
+    if upside_downside > 0.10:
+        signal = "UNDERVALUED"
+    elif upside_downside < -0.10:
+        signal = "OVERVALUED"
+    else:
+        signal = "FAIRLY VALUED"
+
+    return {
+        "projected_fcfs": projected_fcfs,
+        "pv_fcfs": pv_fcfs,
+        "terminal_value": terminal_value,
+        "pv_terminal_value": pv_terminal_value,
+        "enterprise_value": enterprise_value,
+        "net_debt": net_debt,
+        "equity_value": equity_value,
+        "implied_share_price": implied_share_price,
+        "upside_downside": upside_downside,
+        "signal": signal,
+    }
+
+
+# -----------------------------
+# App UI
+# -----------------------------
+st.title("📈 Any Stock DCF Calculator")
+st.write(
+    "Type any stock ticker. The app pulls Yahoo Finance data, fills the model, and calculates enterprise value, "
+    "equity value, implied share price, upside/downside, and valuation signal."
+)
+
+with st.expander("What the app calculates"):
+    st.markdown(
+        """
+        **Enterprise Value** = PV of forecast free cash flows + PV of terminal value  
+        **Equity Value** = Enterprise Value − Net Debt  
+        **Implied Share Price** = Equity Value ÷ Shares Outstanding  
+        **Upside / Downside** = Implied Share Price ÷ Current Price − 1  
+
+        Signal rule:
+        - More than **+10%** upside = **Undervalued**
+        - More than **-10%** downside = **Overvalued**
+        - Between those = **Fairly Valued**
+        """
+    )
+
+ticker_symbol = st.text_input("Enter any stock ticker", value="AAPL").upper().strip()
+calculate_button = st.button("Calculate DCF", type="primary")
+
+st.sidebar.header("DCF Assumptions")
+growth_rate = st.sidebar.number_input("Annual FCF growth rate", value=0.05, step=0.01, format="%.2f")
+forecast_years = st.sidebar.slider("Forecast years", min_value=3, max_value=10, value=5)
+wacc = st.sidebar.number_input("Discount rate / WACC", min_value=0.01, max_value=0.50, value=0.09, step=0.005, format="%.3f")
+terminal_growth = st.sidebar.number_input("Terminal growth rate", min_value=-0.05, max_value=0.10, value=0.025, step=0.005, format="%.3f")
+
+if calculate_button or ticker_symbol:
+    if not ticker_symbol:
+        st.warning("Please type a ticker.")
+        st.stop()
+
+    with st.spinner(f"Pulling Yahoo Finance data for {ticker_symbol}..."):
+        info, cashflow, balance, income, history = load_yahoo(ticker_symbol)
+
+    auto = build_auto_inputs(info, cashflow, balance, income, history)
+
+    company_name = info.get("longName") or info.get("shortName") or ticker_symbol
+    currency = info.get("financialCurrency") or info.get("currency") or "USD"
+
+    st.subheader(f"{company_name} ({ticker_symbol})")
+    st.caption(f"Currency: {currency} | Refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    st.sidebar.header("Auto-filled Yahoo Inputs")
+    st.sidebar.caption("These start from Yahoo Finance. Edit them only if something looks wrong or missing.")
+
+    base_fcf = st.sidebar.number_input(
+        "Base free cash flow",
+        value=safe_input_default(auto["free_cash_flow"]),
+        step=100_000_000.0,
+    )
+    cash = st.sidebar.number_input(
+        "Cash",
+        value=safe_input_default(auto["cash"]),
+        step=100_000_000.0,
+    )
+    debt = st.sidebar.number_input(
+        "Debt",
+        value=safe_input_default(auto["debt"]),
+        step=100_000_000.0,
+    )
+    shares = st.sidebar.number_input(
+        "Shares outstanding",
+        value=safe_input_default(auto["shares"]),
+        step=10_000_000.0,
+    )
+    current_price = st.sidebar.number_input(
+        "Current share price",
+        value=safe_input_default(auto["current_price"]),
+        step=1.0,
+    )
+
+    missing = []
+    if base_fcf <= 0:
+        missing.append("positive free cash flow")
+    if shares <= 0:
+        missing.append("shares outstanding")
+    if current_price <= 0:
+        missing.append("current share price")
+    if wacc <= terminal_growth:
+        missing.append("WACC greater than terminal growth")
+
+    if missing:
+        st.error(
+            "The app needs these inputs to calculate the DCF: "
+            + ", ".join(missing)
+            + ". Enter them in the sidebar and rerun."
+        )
+        st.stop()
+
+    dcf = calculate_dcf(
+        base_fcf=base_fcf,
+        growth_rate=growth_rate,
+        years=forecast_years,
+        wacc=wacc,
+        terminal_growth=terminal_growth,
+        cash=cash,
+        debt=debt,
+        shares=shares,
+        current_price=current_price,
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Enterprise Value", fmt_money(dcf["enterprise_value"]))
+    col2.metric("Equity Value", fmt_money(dcf["equity_value"]))
+    col3.metric("Implied Share Price", fmt_price(dcf["implied_share_price"]))
+    col4.metric("Upside / Downside", fmt_pct(dcf["upside_downside"]))
+    col5.metric("Signal", dcf["signal"])
+
+    tab1, tab2, tab3, tab4 = st.tabs(["DCF Output", "Yahoo Data Used", "Forecast Table", "Teaching"])
+
+    with tab1:
+        summary = pd.DataFrame(
+            {
+                "Item": [
+                    "Base free cash flow",
+                    "PV of forecast FCF",
+                    "Terminal value",
+                    "PV of terminal value",
+                    "Enterprise value",
+                    "Cash",
+                    "Debt",
+                    "Net debt",
+                    "Equity value",
+                    "Shares outstanding",
+                    "Current share price",
+                    "Implied share price",
+                    "Upside / downside",
+                    "Signal",
+                ],
+                "Value": [
+                    fmt_money(base_fcf),
+                    fmt_money(sum(dcf["pv_fcfs"])),
+                    fmt_money(dcf["terminal_value"]),
+                    fmt_money(dcf["pv_terminal_value"]),
+                    fmt_money(dcf["enterprise_value"]),
+                    fmt_money(cash),
+                    fmt_money(debt),
+                    fmt_money(dcf["net_debt"]),
+                    fmt_money(dcf["equity_value"]),
+                    f"{shares:,.0f}",
+                    fmt_price(current_price),
+                    fmt_price(dcf["implied_share_price"]),
+                    fmt_pct(dcf["upside_downside"]),
+                    dcf["signal"],
+                ],
+            }
+        )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    with tab2:
+        yahoo_df = pd.DataFrame(
+            {
+                "Yahoo Finance Field": [
+                    "Current price",
+                    "Market cap",
+                    "Yahoo enterprise value",
+                    "Shares outstanding",
+                    "Cash",
+                    "Debt",
+                    "Operating cash flow",
+                    "Capital expenditures",
+                    "Free cash flow estimate",
+                    "Revenue",
+                    "EBIT",
+                ],
+                "Value Pulled": [
+                    fmt_price(auto["current_price"]),
+                    fmt_money(auto["market_cap"]),
+                    fmt_money(auto["yahoo_enterprise_value"]),
+                    "N/A" if auto["shares"] is None else f"{auto['shares']:,.0f}",
+                    fmt_money(auto["cash"]),
+                    fmt_money(auto["debt"]),
+                    fmt_money(auto["operating_cash_flow"]),
+                    fmt_money(auto["capex"]),
+                    fmt_money(auto["free_cash_flow"]),
+                    fmt_money(auto["revenue"]),
+                    fmt_money(auto["ebit"]),
+                ],
+            }
+        )
+        st.dataframe(yahoo_df, use_container_width=True, hide_index=True)
+
+    with tab3:
+        forecast_df = pd.DataFrame(
+            {
+                "Year": [f"Year {i}" for i in range(1, forecast_years + 1)],
+                "Projected FCF": [fmt_money(x) for x in dcf["projected_fcfs"]],
+                "PV of FCF": [fmt_money(x) for x in dcf["pv_fcfs"]],
+            }
+        )
+        st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+
+    with tab4:
+        st.markdown(
+            """
+            ### How to read this DCF
+
+            **1. Free cash flow**  
+            The app estimates free cash flow from Yahoo Finance as:
+
+            `Free Cash Flow = Operating Cash Flow + Capital Expenditures`
+
+            **2. Enterprise value**  
+            Enterprise value is the value of the operating business:
+
+            `Enterprise Value = PV of Forecast FCF + PV of Terminal Value`
+
+            **3. Equity value**  
+            Equity value is what belongs to common shareholders:
+
+            `Equity Value = Enterprise Value - Net Debt`
+
+            **4. Implied share price**  
+            The app divides equity value by shares outstanding:
+
+            `Implied Share Price = Equity Value / Shares Outstanding`
+
+            **5. Signal**  
+            The model compares implied price to market price:
+            - If implied price is more than 10% above market price: **undervalued**
+            - If implied price is more than 10% below market price: **overvalued**
+            - Otherwise: **fairly valued**
+            """
+        )
+
+st.caption("Educational model only. Yahoo Finance / yfinance data may be missing, delayed, or inconsistent.")
+
+
+
+# Any Stock DCF Calculator
+
+Type any stock ticker and the Streamlit app pulls Yahoo Finance data through `yfinance`, then calculates:
+
+- Enterprise value
+- Equity value
+- Implied share price
+- Upside/downside
+- Undervalued / overvalued / fairly valued signal
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Deploy on Streamlit Community Cloud
+
+Upload these files to GitHub:
+
+- `app.py`
+- `requirements.txt`
+- `README.md`
+
+Then create a new Streamlit app and set the main file path to:
+
+```text
+app.py
+```
+
+
+
+
+
+streamlit==1.40.2
+yfinance==0.2.50
+pandas==2.2.3
+numpy==2.1.3
